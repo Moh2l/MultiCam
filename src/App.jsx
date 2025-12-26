@@ -219,25 +219,56 @@ const DirectorDashboard = ({ onBack }) => {
     const [gallery, setGallery] = useState([]);
     const [showGallery, setShowGallery] = useState(false);
 
+    // Enregistrement Multi-Flux
+    const recordersRef = useRef({}); // Stocke les MediaRecorders actifs { camId: recorder }
+    const recordedChunksRef = useRef({}); // Stocke les données { camId: [blob, blob] }
+
     const activeStreamObj = activeStreamId
         ? streams.find(s => s.id === activeStreamId)
         : streams[0];
 
-    // Gestion du Timer REC
+    // Gestion du Timer REC et Enregistrement Réel
     useEffect(() => {
         let interval;
         if (tally === 'RECORDING') {
             if (!recStartTime) setRecStartTime(Date.now());
+
+            // Démarrer l'enregistrement pour TOUS les flux connectés
+            streams.forEach(streamObj => {
+                try {
+                    const options = { mimeType: 'video/webm' }; // Standard web
+                    const recorder = new MediaRecorder(streamObj.stream, options);
+
+                    recordedChunksRef.current[streamObj.id] = []; // Init buffer
+
+                    recorder.ondataavailable = (e) => {
+                        if (e.data.size > 0) recordedChunksRef.current[streamObj.id].push(e.data);
+                    };
+
+                    recorder.start();
+                    recordersRef.current[streamObj.id] = recorder;
+                    console.log(`Enregistrement démarré pour CAM ${streamObj.id}`);
+                } catch (e) {
+                    console.error("Erreur enregistrement:", e);
+                }
+            });
+
             interval = setInterval(() => {
                 setElapsedTime(Date.now() - (recStartTime || Date.now()));
             }, 1000);
         } else {
+            // STOP Recording
+            Object.values(recordersRef.current).forEach(recorder => {
+                if (recorder.state !== 'inactive') recorder.stop();
+            });
+            recordersRef.current = {}; // Reset recorders
+
             clearInterval(interval);
             setRecStartTime(null);
             setElapsedTime(0);
         }
         return () => clearInterval(interval);
-    }, [tally, recStartTime]);
+    }, [tally, recStartTime]); // Note: streams n'est pas dans les dépendances pour simplifier (pas de hot-plug pendant REC)
 
     const toggleRecording = () => {
         const newStatus = tally === 'STANDBY' ? 'RECORDING' : 'STANDBY';
@@ -246,15 +277,24 @@ const DirectorDashboard = ({ onBack }) => {
         // Création du clip à l'arrêt
         if (newStatus === 'STANDBY' && recStartTime) {
             const duration = Math.floor((Date.now() - recStartTime) / 1000);
-            if (duration > 1) { // On ignore les clics accidentels < 1s
+            if (duration > 1) {
+                // Sauvegarder les blobs actuels dans un objet Clip pour la galerie
+                const currentBlobs = {};
+                Object.keys(recordedChunksRef.current).forEach(camId => {
+                    const blob = new Blob(recordedChunksRef.current[camId], { type: 'video/webm' });
+                    currentBlobs[camId] = blob;
+                });
+
                 const newClip = {
                     id: Date.now(),
                     time: new Date().toLocaleTimeString(),
                     duration: formatDuration(duration * 1000),
-                    angles: streams.length
+                    angles: Object.keys(currentBlobs).length,
+                    blobs: currentBlobs // On stocke les vraies données vidéo
                 };
+
                 setGallery(prev => [newClip, ...prev]);
-                setShowGallery(true); // Ouvre la galerie automatiquement
+                setShowGallery(true);
             }
         }
     };
@@ -264,6 +304,41 @@ const DirectorDashboard = ({ onBack }) => {
         const m = Math.floor(totalSeconds / 60).toString().padStart(2, '0');
         const s = (totalSeconds % 60).toString().padStart(2, '0');
         return `${m}:${s}`;
+    };
+
+    // Fonction pour télécharger le ZIP réel
+    const downloadClip = async (clip) => {
+        try {
+            // Import dynamique de JSZip pour ne pas alourdir le chargement initial
+            // Note: En production réelle, installez 'jszip' via npm.
+            // Ici on utilise une version CDN pour que ça marche direct en copier-coller.
+            /* eslint-disable no-eval */
+            const JSZip = (await import('https://jspm.dev/jszip')).default;
+
+            const zip = new JSZip();
+            const folder = zip.folder(`MultiCam_Session_${clip.id}`);
+
+            let index = 1;
+            for (const [camId, blob] of Object.entries(clip.blobs)) {
+                folder.file(`Angle_${index}_${camId}.webm`, blob);
+                index++;
+            }
+
+            const content = await zip.generateAsync({ type: "blob" });
+            const url = URL.createObjectURL(content);
+
+            const a = document.createElement('a');
+            a.href = url;
+            a.download = `MultiCam_Clip_${clip.time.replace(/:/g, '-')}.zip`;
+            document.body.appendChild(a);
+            a.click();
+            document.body.removeChild(a);
+            URL.revokeObjectURL(url);
+
+        } catch (e) {
+            console.error("Erreur génération ZIP:", e);
+            alert("Erreur lors de la création du ZIP. Vérifiez votre connexion internet pour charger JSZip.");
+        }
     };
 
     return (
@@ -298,7 +373,7 @@ const DirectorDashboard = ({ onBack }) => {
                                 <h2 className="text-3xl font-bold flex items-center gap-3"><Film /> Galerie des Clips</h2>
                                 <button onClick={() => setShowGallery(false)} className="p-2 hover:bg-white/10 rounded-full"><X /></button>
                             </div>
-                            <div className="grid grid-cols-2 md:grid-cols-3 gap-4 overflow-y-auto">
+                            <div className="grid grid-cols-2 md:grid-cols-3 gap-4 overflow-y-auto pb-20">
                                 {gallery.map(clip => (
                                     <div key={clip.id} className="bg-white/5 border border-white/10 p-4 rounded-xl hover:bg-white/10 transition-colors group">
                                         <div className="aspect-video bg-black/40 rounded-lg mb-3 flex items-center justify-center relative overflow-hidden">
@@ -310,8 +385,13 @@ const DirectorDashboard = ({ onBack }) => {
                                                 <div className="font-bold">Clip {clip.time}</div>
                                                 <div className="text-xs text-white/40">{clip.angles} Angle(s) synchro</div>
                                             </div>
-                                            <button className="p-2 text-blue-400 hover:text-white hover:bg-blue-500 rounded-lg transition-colors" title="Télécharger Multi-view">
+                                            <button
+                                                onClick={() => downloadClip(clip)}
+                                                className="p-2 text-blue-400 hover:text-white hover:bg-blue-500 rounded-lg transition-colors flex flex-col items-center"
+                                                title="Télécharger Multi-view (ZIP)"
+                                            >
                                                 <Download size={18} />
+                                                <span className="text-[9px] mt-1 font-bold">ZIP</span>
                                             </button>
                                         </div>
                                     </div>
