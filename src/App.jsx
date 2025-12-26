@@ -2,7 +2,7 @@ import React, { useState, useEffect, useRef, useMemo } from 'react';
 import {
     Camera, Monitor, Play, Square, Pen, Circle, Share2,
     Wifi, Battery, ChevronLeft, Eraser, Link, AlertCircle,
-    ArrowRight, X, Undo2, MousePointer2, Rewind
+    ArrowRight, X, Undo2, MousePointer2, Rewind, Download, Clock, Film
 } from 'lucide-react';
 import Peer from 'peerjs';
 
@@ -13,8 +13,8 @@ const BENTO_ROUND = "rounded-[24px]";
 // --- HOOK: WEB RTC & SIGNALING ---
 const useOpticSignaling = (role, inputCode = null) => {
     const [peer, setPeer] = useState(null);
-    const [myId, setMyId] = useState('');     // L'ID technique complet
-    const [shortCode, setShortCode] = useState(''); // Le code à 4 chiffres
+    const [myId, setMyId] = useState('');
+    const [shortCode, setShortCode] = useState('');
     const [status, setStatus] = useState('INIT');
     const [streams, setStreams] = useState([]);
     const [tally, setTally] = useState('STANDBY');
@@ -22,18 +22,13 @@ const useOpticSignaling = (role, inputCode = null) => {
 
     useEffect(() => {
         let newPeer;
-
         const init = async () => {
             setStatus('CONNECTING');
-
             let peerId;
             let displayCode;
 
-            // 1. GÉNÉRATION DU CODE À 4 CHIFFRES (Côté Hub)
             if (role === 'DIRECTOR') {
-                // Génère un code entre 1000 et 9999
                 displayCode = Math.floor(1000 + Math.random() * 9000).toString();
-                // Préfixe technique pour éviter les collisions avec d'autres utilisateurs de PeerJS
                 peerId = `optic-flow-${displayCode}`;
                 setShortCode(displayCode);
             }
@@ -45,15 +40,11 @@ const useOpticSignaling = (role, inputCode = null) => {
                 newPeer.on('open', (id) => {
                     setMyId(id);
                     setStatus('READY');
-
-                    // Si on est SATELLITE, on se connecte en utilisant le code entré
                     if (role === 'SATELLITE' && inputCode) {
-                        const targetId = `optic-flow-${inputCode}`;
-                        connectToHub(newPeer, targetId);
+                        connectToHub(newPeer, `optic-flow-${inputCode}`);
                     }
                 });
 
-                // --- DIRECTOR: Réception des flux ---
                 newPeer.on('call', (call) => {
                     if (role === 'DIRECTOR') {
                         call.answer();
@@ -66,7 +57,6 @@ const useOpticSignaling = (role, inputCode = null) => {
                     }
                 });
 
-                // --- DATA CHANNEL (Tally) ---
                 newPeer.on('connection', (conn) => {
                     conn.on('open', () => {
                         connectionsRef.current.push(conn);
@@ -84,7 +74,6 @@ const useOpticSignaling = (role, inputCode = null) => {
         };
 
         init();
-
         return () => { if (newPeer) newPeer.destroy(); };
     }, [role, inputCode]);
 
@@ -94,9 +83,7 @@ const useOpticSignaling = (role, inputCode = null) => {
                 video: { width: 1280, facingMode: 'environment' },
                 audio: false
             });
-            // Appel vidéo
             const call = currentPeer.call(hubId, stream);
-            // Canal de données
             const conn = currentPeer.connect(hubId);
             conn.on('data', (data) => {
                 if (data.type === 'TALLY') setTally(data.status);
@@ -115,7 +102,12 @@ const useOpticSignaling = (role, inputCode = null) => {
         });
     };
 
-    return { shortCode, status, streams, tally, broadcastTally };
+    // Nouvelle fonction pour supprimer une caméra manuellement
+    const removeStream = (id) => {
+        setStreams(prev => prev.filter(s => s.id !== id));
+    };
+
+    return { shortCode, status, streams, tally, broadcastTally, removeStream };
 };
 
 
@@ -150,7 +142,7 @@ const App = () => {
     );
 };
 
-// --- 1. LANDING SCREEN (Modifié pour Code 4 Chiffres) ---
+// --- LANDING SCREEN ---
 const LandingScreen = ({ onSelectRole, onJoin }) => {
     const [inputCode, setInputCode] = useState('');
     const [isJoinMode, setIsJoinMode] = useState(false);
@@ -213,22 +205,65 @@ const LandingScreen = ({ onSelectRole, onJoin }) => {
     );
 };
 
-// --- 2. DIRECTOR DASHBOARD (Avec Mémoire Tampon) ---
+// --- DIRECTOR DASHBOARD ---
 const DirectorDashboard = ({ onBack }) => {
-    const { shortCode, streams, tally, broadcastTally } = useOpticSignaling('DIRECTOR');
+    const { shortCode, streams, tally, broadcastTally, removeStream } = useOpticSignaling('DIRECTOR');
 
     const [activeStreamId, setActiveStreamId] = useState(null);
-    const [mode, setMode] = useState('LIVE'); // LIVE vs ANALYSIS
+    const [mode, setMode] = useState('LIVE');
     const [showInfo, setShowInfo] = useState(true);
 
-    // Flux actif par défaut (le premier ou celui sélectionné)
+    // Timer & Galerie
+    const [recStartTime, setRecStartTime] = useState(null);
+    const [elapsedTime, setElapsedTime] = useState(0);
+    const [gallery, setGallery] = useState([]);
+    const [showGallery, setShowGallery] = useState(false);
+
     const activeStreamObj = activeStreamId
         ? streams.find(s => s.id === activeStreamId)
         : streams[0];
 
+    // Gestion du Timer REC
+    useEffect(() => {
+        let interval;
+        if (tally === 'RECORDING') {
+            if (!recStartTime) setRecStartTime(Date.now());
+            interval = setInterval(() => {
+                setElapsedTime(Date.now() - (recStartTime || Date.now()));
+            }, 1000);
+        } else {
+            clearInterval(interval);
+            setRecStartTime(null);
+            setElapsedTime(0);
+        }
+        return () => clearInterval(interval);
+    }, [tally, recStartTime]);
+
     const toggleRecording = () => {
         const newStatus = tally === 'STANDBY' ? 'RECORDING' : 'STANDBY';
         broadcastTally(newStatus);
+
+        // Création du clip à l'arrêt
+        if (newStatus === 'STANDBY' && recStartTime) {
+            const duration = Math.floor((Date.now() - recStartTime) / 1000);
+            if (duration > 1) { // On ignore les clics accidentels < 1s
+                const newClip = {
+                    id: Date.now(),
+                    time: new Date().toLocaleTimeString(),
+                    duration: formatDuration(duration * 1000),
+                    angles: streams.length
+                };
+                setGallery(prev => [newClip, ...prev]);
+                setShowGallery(true); // Ouvre la galerie automatiquement
+            }
+        }
+    };
+
+    const formatDuration = (ms) => {
+        const totalSeconds = Math.floor(ms / 1000);
+        const m = Math.floor(totalSeconds / 60).toString().padStart(2, '0');
+        const s = (totalSeconds % 60).toString().padStart(2, '0');
+        return `${m}:${s}`;
     };
 
     return (
@@ -238,7 +273,7 @@ const DirectorDashboard = ({ onBack }) => {
             <div className="flex flex-col flex-grow gap-4 w-3/4 h-full relative">
                 <div className={`relative flex-grow ${GLASS_PANEL} ${BENTO_ROUND} overflow-hidden group bg-[#111]`}>
 
-                    {/* Code Overlay (si pas de caméra ou demandé) */}
+                    {/* Code Overlay */}
                     {(showInfo || streams.length === 0) && (
                         <div className="absolute top-1/2 left-1/2 -translate-x-1/2 -translate-y-1/2 bg-black/90 backdrop-blur-md p-10 rounded-3xl text-center border border-white/10 z-[60] shadow-2xl">
                             <p className="text-white/50 text-sm uppercase tracking-widest mb-4">Code de connexion</p>
@@ -256,10 +291,40 @@ const DirectorDashboard = ({ onBack }) => {
                         </div>
                     )}
 
-                    {/* --- SMART VIDEO PLAYER (Gère Live + Replay) --- */}
+                    {/* Galerie Modal */}
+                    {showGallery && (
+                        <div className="absolute inset-0 bg-black/90 backdrop-blur-xl z-[70] p-8 flex flex-col animate-in fade-in zoom-in-95">
+                            <div className="flex justify-between items-center mb-6">
+                                <h2 className="text-3xl font-bold flex items-center gap-3"><Film /> Galerie des Clips</h2>
+                                <button onClick={() => setShowGallery(false)} className="p-2 hover:bg-white/10 rounded-full"><X /></button>
+                            </div>
+                            <div className="grid grid-cols-2 md:grid-cols-3 gap-4 overflow-y-auto">
+                                {gallery.map(clip => (
+                                    <div key={clip.id} className="bg-white/5 border border-white/10 p-4 rounded-xl hover:bg-white/10 transition-colors group">
+                                        <div className="aspect-video bg-black/40 rounded-lg mb-3 flex items-center justify-center relative overflow-hidden">
+                                            <Play className="text-white/50 group-hover:text-white transition-colors" />
+                                            <div className="absolute bottom-2 right-2 bg-black/60 px-2 py-0.5 rounded text-xs font-mono">{clip.duration}</div>
+                                        </div>
+                                        <div className="flex justify-between items-start">
+                                            <div>
+                                                <div className="font-bold">Clip {clip.time}</div>
+                                                <div className="text-xs text-white/40">{clip.angles} Angle(s) synchro</div>
+                                            </div>
+                                            <button className="p-2 text-blue-400 hover:text-white hover:bg-blue-500 rounded-lg transition-colors" title="Télécharger Multi-view">
+                                                <Download size={18} />
+                                            </button>
+                                        </div>
+                                    </div>
+                                ))}
+                                {gallery.length === 0 && <div className="text-white/30 italic">Aucun enregistrement.</div>}
+                            </div>
+                        </div>
+                    )}
+
+                    {/* Video Player */}
                     {activeStreamObj ? (
                         <SmartVideoSource
-                            key={activeStreamObj.id} // Reset si on change de caméra
+                            key={activeStreamObj.id}
                             stream={activeStreamObj.stream}
                             mode={mode}
                         />
@@ -269,10 +334,10 @@ const DirectorDashboard = ({ onBack }) => {
                         </div>
                     )}
 
-                    {/* Canvas de Dessin (Uniquement en Analyse) */}
+                    {/* Telestrator */}
                     {mode === 'ANALYSIS' && <TelestratorCanvas />}
 
-                    {/* UI Overlay (Mode & Tally) */}
+                    {/* Top Left Status */}
                     <div className="absolute top-6 left-6 flex gap-2 z-50">
                         <button onClick={onBack} className="p-2 rounded-full bg-black/40 hover:bg-white/20 text-white/70 backdrop-blur-md transition-colors mr-2">
                             <ChevronLeft size={16} />
@@ -281,8 +346,9 @@ const DirectorDashboard = ({ onBack }) => {
                             {mode}
                         </div>
                         {tally === 'RECORDING' && (
-                            <div className="px-3 py-1.5 bg-red-500 rounded-full text-xs font-bold text-white animate-pulse shadow-[0_0_15px_rgba(239,68,68,0.5)]">
-                                REC
+                            <div className="px-3 py-1.5 bg-red-500 rounded-full text-xs font-bold text-white animate-pulse shadow-[0_0_15px_rgba(239,68,68,0.5)] flex items-center gap-2">
+                                <span>REC</span>
+                                <span className="font-mono">{formatDuration(elapsedTime)}</span>
                             </div>
                         )}
                     </div>
@@ -291,7 +357,6 @@ const DirectorDashboard = ({ onBack }) => {
                 {/* CONTROLS BAR */}
                 <div className={`h-24 ${GLASS_PANEL} ${BENTO_ROUND} flex items-center px-8 justify-between shrink-0`}>
 
-                    {/* Section Gauche : Record & Info */}
                     <div className="flex items-center gap-6">
                         <button onClick={toggleRecording} className="group relative flex items-center justify-center">
                             <div className={`w-14 h-14 rounded-full border-2 transition-all duration-300 flex items-center justify-center ${tally === 'RECORDING' ? 'border-red-500 bg-red-500/10' : 'border-white/20 group-hover:border-white'}`}>
@@ -300,7 +365,7 @@ const DirectorDashboard = ({ onBack }) => {
                         </button>
                         <div className="flex flex-col">
                             <span className="text-xs text-white/40 uppercase tracking-widest font-semibold">
-                                {mode === 'LIVE' ? 'Direct' : 'Replay'}
+                                {tally === 'RECORDING' ? formatDuration(elapsedTime) : (mode === 'LIVE' ? 'Direct' : 'Replay')}
                             </span>
                             <span className="text-xl font-mono tabular-nums tracking-tight text-white/90">
                                 {streams.length} Angle(s)
@@ -308,21 +373,24 @@ const DirectorDashboard = ({ onBack }) => {
                         </div>
                     </div>
 
-                    {/* Section Centrale : Switch Mode */}
                     <div className="flex items-center bg-black/20 p-1.5 rounded-full border border-white/5">
                         <button onClick={() => setMode('LIVE')} className={`px-6 py-2 rounded-full text-sm font-medium transition-all ${mode === 'LIVE' ? 'bg-white text-black shadow-lg' : 'text-white/50'}`}>Live</button>
                         <button onClick={() => setMode('ANALYSIS')} className={`px-6 py-2 rounded-full text-sm font-medium transition-all ${mode === 'ANALYSIS' ? 'bg-white text-black shadow-lg' : 'text-white/50'}`}>Analyse</button>
                     </div>
 
-                    {/* Section Droite : Code Info */}
-                    <button onClick={() => setShowInfo(true)} className="flex items-center gap-2 px-4 py-2 hover:bg-white/10 rounded-full text-white/50 hover:text-white transition-colors">
-                        <span className="font-mono font-bold text-lg">{shortCode}</span>
-                        <Share2 size={18} />
-                    </button>
+                    <div className="flex gap-2">
+                        <button onClick={() => setShowGallery(true)} className="p-3 hover:bg-white/10 rounded-full text-white/50 hover:text-white transition-colors" title="Galerie">
+                            <Film size={20} />
+                        </button>
+                        <button onClick={() => setShowInfo(true)} className="flex items-center gap-2 px-4 py-2 hover:bg-white/10 rounded-full text-white/50 hover:text-white transition-colors">
+                            <span className="font-mono font-bold text-lg">{shortCode}</span>
+                            <Share2 size={18} />
+                        </button>
+                    </div>
                 </div>
             </div>
 
-            {/* MULTIVIEW GRID (Droite) */}
+            {/* MULTIVIEW GRID */}
             <div className="w-1/4 flex flex-col gap-4 h-full">
                 <h2 className="px-2 text-xs font-bold text-white/40 uppercase tracking-widest pt-2">Sources</h2>
                 <div className="flex flex-col gap-3 overflow-y-auto pr-1 pb-2">
@@ -332,9 +400,19 @@ const DirectorDashboard = ({ onBack }) => {
                             onClick={() => setActiveStreamId(s.id)}
                             className={`aspect-video rounded-xl relative cursor-pointer overflow-hidden transition-all duration-200 group ${activeStreamId === s.id ? 'ring-2 ring-blue-500 shadow-lg scale-[1.02]' : 'opacity-60 hover:opacity-100'} ${GLASS_PANEL}`}
                         >
-                            {/* Vignette toujours en direct */}
                             <VideoPlayer stream={s.stream} muted className="w-full h-full object-cover" />
                             <div className="absolute bottom-2 left-2 z-20 text-[10px] font-bold text-white bg-black/50 px-2 py-0.5 rounded">CAM {idx + 1}</div>
+
+                            {/* Bouton de suppression (Croix Rouge) */}
+                            <button
+                                onClick={(e) => {
+                                    e.stopPropagation();
+                                    if (confirm("Déconnecter cette caméra ?")) removeStream(s.id);
+                                }}
+                                className="absolute top-2 right-2 z-30 bg-red-500 hover:bg-red-600 text-white rounded-full p-1 opacity-0 group-hover:opacity-100 transition-opacity"
+                            >
+                                <X size={12} />
+                            </button>
                         </div>
                     ))}
                 </div>
@@ -343,47 +421,31 @@ const DirectorDashboard = ({ onBack }) => {
     );
 };
 
-// --- NOUVEAU COMPOSANT : SMART VIDEO PLAYER (Live + Buffer) ---
+// --- SMART PLAYER ---
 const SmartVideoSource = ({ stream, mode }) => {
-    const videoRef = useRef(null);
     const mediaRecorderRef = useRef(null);
-    const chunksRef = useRef([]); // Stocke les morceaux de vidéo en mémoire
+    const chunksRef = useRef([]);
     const [videoBlobUrl, setVideoBlobUrl] = useState(null);
 
-    // 1. Initialisation de l'enregistrement en continu dès que le stream arrive
     useEffect(() => {
         if (!stream) return;
-
-        // Configuration pour enregistrer
-        // Note: Safari mobile préfère video/mp4, Chrome video/webm. On laisse le navigateur choisir.
         let options = { mimeType: 'video/webm;codecs=vp9' };
         if (!MediaRecorder.isTypeSupported(options.mimeType)) {
-            options = { mimeType: 'video/webm' }; // Fallback
-            if (!MediaRecorder.isTypeSupported(options.mimeType)) {
-                options = {}; // Fallback par défaut du navigateur (souvent mp4 sur Safari)
-            }
+            options = { mimeType: 'video/webm' };
+            if (!MediaRecorder.isTypeSupported(options.mimeType)) options = {};
         }
 
         try {
             const recorder = new MediaRecorder(stream, options);
             mediaRecorderRef.current = recorder;
-            chunksRef.current = []; // Reset du buffer
+            chunksRef.current = [];
 
             recorder.ondataavailable = (e) => {
-                if (e.data.size > 0) {
-                    chunksRef.current.push(e.data);
-
-                    // --- GESTION DE LA MÉMOIRE TAMPON (LIMITATION) ---
-                    // Pour éviter de crasher le navigateur, on pourrait limiter la taille ici.
-                    // Pour l'instant on garde tout depuis le début de la connexion.
-                }
+                if (e.data.size > 0) chunksRef.current.push(e.data);
             };
 
-            recorder.start(1000); // Sauvegarde un morceau chaque seconde (1000ms)
-            console.log("Enregistrement tampon démarré...");
-
+            recorder.start(1000);
             return () => {
-                // Nettoyage si on change de caméra
                 if (recorder.state !== 'inactive') recorder.stop();
                 if (videoBlobUrl) URL.revokeObjectURL(videoBlobUrl);
             };
@@ -392,23 +454,18 @@ const SmartVideoSource = ({ stream, mode }) => {
         }
     }, [stream]);
 
-    // 2. Gestion du changement de mode (Live <-> Analyse)
     useEffect(() => {
         if (mode === 'ANALYSIS' && chunksRef.current.length > 0) {
-            // On génère le fichier vidéo virtuel (Blob)
             const blob = new Blob(chunksRef.current, { type: 'video/webm' });
             const url = URL.createObjectURL(blob);
             setVideoBlobUrl(url);
         }
-        // En mode LIVE, on reste sur le flux direct, pas besoin de reset l'URL
     }, [mode]);
 
-    // Si on est en LIVE, on affiche le flux WebRTC
     if (mode === 'LIVE') {
         return <VideoPlayer stream={stream} className="w-full h-full object-contain" />;
     }
 
-    // Si on est en ANALYSE, on affiche le fichier enregistré avec contrôles
     return (
         <div className="w-full h-full relative group">
             {videoBlobUrl ? (
@@ -416,7 +473,6 @@ const SmartVideoSource = ({ stream, mode }) => {
                     src={videoBlobUrl}
                     controls
                     className="w-full h-full object-contain"
-                    // Astuce : désactiver le download natif pour garder le style propre
                     controlsList="nodownload"
                 />
             ) : (
@@ -424,12 +480,11 @@ const SmartVideoSource = ({ stream, mode }) => {
                     Chargement du Replay...
                 </div>
             )}
-            {/* Note : Le canvas de dessin (Telestrator) se superpose par dessus ça dans le composant parent */}
         </div>
     );
 };
 
-// --- 3. SATELLITE VIEW (Simple) ---
+// --- SATELLITE VIEW ---
 const SatelliteView = ({ onBack, code }) => {
     const { status, streams, tally } = useOpticSignaling('SATELLITE', code);
     const localStream = streams[0]?.stream;
@@ -438,7 +493,6 @@ const SatelliteView = ({ onBack, code }) => {
     return (
         <div className="relative w-full h-full bg-black overflow-hidden flex items-center justify-center">
             <div className={`absolute inset-0 z-50 pointer-events-none transition-all duration-300 border-[12px] rounded-[32px] ${isRecording ? 'border-red-500 animate-pulse' : 'border-green-500 opacity-50'}`} />
-
             <div className="w-full h-full bg-[#1c1c1e] relative">
                 {localStream ? (
                     <VideoPlayer stream={localStream} muted className="w-full h-full object-cover" />
@@ -449,8 +503,6 @@ const SatelliteView = ({ onBack, code }) => {
                     </div>
                 )}
             </div>
-
-            {/* HUD */}
             <div className="absolute top-8 left-8 right-8 flex justify-between items-start z-40">
                 <button onClick={onBack} className="p-2 rounded-full bg-black/40 backdrop-blur text-white/70 hover:bg-white/20">
                     <ChevronLeft size={20} />
@@ -467,24 +519,18 @@ const SatelliteView = ({ onBack, code }) => {
     );
 };
 
-// --- OUTILS (Dessin, Vidéo simple, etc.) ---
-
-const VideoPlayer = ({ stream, muted = false, className }) => {
-    const ref = useRef(null);
-    useEffect(() => {
-        if (ref.current && stream) ref.current.srcObject = stream;
-    }, [stream]);
-    return <video ref={ref} autoPlay playsInline muted={muted} className={className} />;
-};
-
+// --- TELESTRATOR (Avec Outil Curseur) ---
 const TelestratorCanvas = () => {
     const canvasRef = useRef(null);
     const [isDrawing, setIsDrawing] = useState(false);
-    const [tool, setTool] = useState('PEN');
+    const [tool, setTool] = useState('CURSOR'); // Par défaut CURSEUR pour permettre le clic
     const [color, setColor] = useState('#FACC15');
     const [history, setHistory] = useState([]);
     const startPos = useRef({ x: 0, y: 0 });
     const snapshot = useRef(null);
+
+    // Le canvas laisse passer les clics si l'outil est CURSOR
+    const pointerEventsClass = tool === 'CURSOR' ? 'pointer-events-none' : 'pointer-events-auto cursor-crosshair';
 
     const getPos = (e) => {
         const canvas = canvasRef.current;
@@ -521,6 +567,7 @@ const TelestratorCanvas = () => {
     };
 
     const startDrawing = (e) => {
+        if (tool === 'CURSOR') return; // Sécurité
         const { x, y } = getPos(e);
         const canvas = canvasRef.current;
         const ctx = canvas.getContext('2d');
@@ -537,7 +584,7 @@ const TelestratorCanvas = () => {
     };
 
     const draw = (e) => {
-        if (!isDrawing) return;
+        if (!isDrawing || tool === 'CURSOR') return;
         const { x, y } = getPos(e);
         const canvas = canvasRef.current;
         const ctx = canvas.getContext('2d');
@@ -559,7 +606,6 @@ const TelestratorCanvas = () => {
         }
     };
 
-    // Logique formes
     const drawArrow = (ctx, fromX, fromY, toX, toY) => {
         const headlen = 20;
         const dx = toX - fromX;
@@ -590,7 +636,7 @@ const TelestratorCanvas = () => {
         <>
             <canvas
                 ref={canvasRef}
-                className="absolute inset-0 z-30 cursor-crosshair touch-none"
+                className={`absolute inset-0 z-30 touch-none ${pointerEventsClass}`}
                 onMouseDown={startDrawing} onMouseMove={draw} onMouseUp={() => setIsDrawing(false)} onMouseLeave={() => setIsDrawing(false)}
                 onTouchStart={startDrawing} onTouchMove={draw} onTouchEnd={() => setIsDrawing(false)}
             />
@@ -599,6 +645,7 @@ const TelestratorCanvas = () => {
                 <ColorBtn color="#EF4444" active={color} onClick={setColor} />
                 <ColorBtn color="#3B82F6" active={color} onClick={setColor} />
                 <div className="w-[1px] bg-white/20 mx-1" />
+                <ToolBtn icon={<MousePointer2 size={18} />} active={tool === 'CURSOR'} onClick={() => setTool('CURSOR')} />
                 <ToolBtn icon={<Pen size={18} />} active={tool === 'PEN'} onClick={() => setTool('PEN')} />
                 <ToolBtn icon={<ArrowRight size={18} />} active={tool === 'ARROW'} onClick={() => setTool('ARROW')} />
                 <ToolBtn icon={<Circle size={18} />} active={tool === 'CIRCLE'} onClick={() => setTool('CIRCLE')} />
@@ -611,12 +658,20 @@ const TelestratorCanvas = () => {
     );
 };
 
+// --- HELPER COMPONENTS ---
 const ToolBtn = ({ icon, active, onClick }) => (
     <button onClick={onClick} className={`p-2 rounded-full transition-all duration-200 ${active ? 'bg-white text-black shadow-lg scale-110' : 'text-white/60 hover:text-white hover:bg-white/10'}`}>{icon}</button>
 );
 const ColorBtn = ({ color, active, onClick }) => (
     <button onClick={() => onClick(color)} className={`w-8 h-8 rounded-full border-2 transition-all duration-200 ${active === color ? 'border-white scale-110 shadow-lg' : 'border-transparent opacity-60 hover:opacity-100'}`} style={{ background: color }} />
 );
+const VideoPlayer = ({ stream, muted = false, className }) => {
+    const ref = useRef(null);
+    useEffect(() => {
+        if (ref.current && stream) ref.current.srcObject = stream;
+    }, [stream]);
+    return <video ref={ref} autoPlay playsInline muted={muted} className={className} />;
+};
 const RoleCard = ({ title, icon, desc, onClick, color }) => (
     <button onClick={onClick} className={`group relative p-8 ${GLASS_PANEL} ${BENTO_ROUND} hover:bg-white/10 transition-all duration-300 text-left`}>
         <div className={`absolute top-6 right-6 p-3 rounded-full transition-colors ${color === 'blue' ? 'bg-blue-500/20 text-blue-400 group-hover:bg-blue-500 group-hover:text-white' : 'bg-green-500/20 text-green-400 group-hover:bg-green-500 group-hover:text-white'}`}>{icon}</div>
