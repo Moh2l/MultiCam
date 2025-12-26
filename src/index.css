@@ -1,0 +1,13 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+/* Force le fond noir et désactive le zoom tactile */
+body {
+    background-color: black;
+    color: white;
+    margin: 0;
+    touch-action: none;
+    overflow: hidden;
+    -webkit-font-smoothing: antialiased;
+}
